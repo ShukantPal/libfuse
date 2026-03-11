@@ -1467,6 +1467,127 @@ static int wait_for_signal(int sock_fd)
 	return 0;
 }
 
+/*
+ * Unescape octal sequences in /proc/self/mountinfo paths.
+ * mountinfo escapes space, tab, newline, and backslash as \NNN octal.
+ * Unescaping is done in-place since the result is always <= input length.
+ */
+static void unescape_mountinfo(char *s)
+{
+	char *d = s;
+	while (*s) {
+		if (s[0] == '\\' &&
+		    s[1] >= '0' && s[1] <= '3' &&
+		    s[2] >= '0' && s[2] <= '7' &&
+		    s[3] >= '0' && s[3] <= '7') {
+			*d++ = (char)((s[1] - '0') << 6 |
+				      (s[2] - '0') << 3 |
+				      (s[3] - '0'));
+			s += 4;
+		} else {
+			*d++ = *s++;
+		}
+	}
+	*d = '\0';
+}
+
+/*
+ * Before unmounting the main FUSE mount point during auto_unmount,
+ * find and unmount any bind mounts that originate from the same
+ * FUSE filesystem.
+ *
+ * When a FUSE process dies, bind mounts from it remain in
+ * "Transport endpoint is not connected" state. We parse
+ * /proc/self/mountinfo to find all mounts sharing the same
+ * major:minor device ID as the main mount point, then unmount
+ * them in reverse order (best-effort, lazy unmount).
+ */
+static void unmount_bind_mounts(const char *mnt)
+{
+	FILE *fp;
+	char *line = NULL;
+	size_t len = 0;
+	unsigned int target_major = 0, target_minor = 0;
+	int found_target = 0;
+	char **paths = NULL;
+	int num_paths = 0;
+	int cap_paths = 0;
+
+	fp = fopen("/proc/self/mountinfo", "r");
+	if (!fp)
+		return;
+
+	/* First pass: find the device ID of our mount point */
+	while (getline(&line, &len, fp) != -1) {
+		unsigned int mid, pid, major, minor;
+		char mount_point[4096];
+
+		if (sscanf(line, "%u %u %u:%u %*s %4095s",
+			   &mid, &pid, &major, &minor,
+			   mount_point) != 5)
+			continue;
+
+		unescape_mountinfo(mount_point);
+
+		if (strcmp(mount_point, mnt) == 0) {
+			target_major = major;
+			target_minor = minor;
+			found_target = 1;
+			break;
+		}
+	}
+
+	if (!found_target)
+		goto out;
+
+	/* Second pass: collect all other mounts with the same device ID */
+	rewind(fp);
+	while (getline(&line, &len, fp) != -1) {
+		unsigned int mid, pid, major, minor;
+		char mount_point[4096];
+
+		if (sscanf(line, "%u %u %u:%u %*s %4095s",
+			   &mid, &pid, &major, &minor,
+			   mount_point) != 5)
+			continue;
+
+		unescape_mountinfo(mount_point);
+
+		if (major == target_major && minor == target_minor &&
+		    strcmp(mount_point, mnt) != 0) {
+			if (num_paths >= cap_paths) {
+				cap_paths = cap_paths ? cap_paths * 2 : 16;
+				char **tmp = realloc(paths,
+						     cap_paths * sizeof(char *));
+				if (!tmp)
+					goto out;
+				paths = tmp;
+			}
+			paths[num_paths] = strdup(mount_point);
+			if (!paths[num_paths])
+				goto out;
+			num_paths++;
+		}
+	}
+
+	/* Unmount in reverse order (last mounted first) */
+	for (int i = num_paths - 1; i >= 0; i--) {
+		if (umount2(paths[i], UMOUNT_DETACH) == -1) {
+			fprintf(stderr,
+				"%s: warning: failed to unmount "
+				"bind mount %s: %s\n",
+				progname, paths[i], strerror(errno));
+		}
+	}
+
+out:
+	for (int i = 0; i < num_paths; i++)
+		free(paths[i]);
+	free(paths);
+	free(line);
+	fclose(fp);
+}
+
 /* Helper for should_auto_unmount
  *
  * fusermount typically has the s-bit set - initial open of `mnt` was as root
@@ -1868,6 +1989,9 @@ wait_for_auto_unmount:
 	if (!should_auto_unmount(mnt, type)) {
 		goto success_out;
 	}
+
+	/* Clean up bind mounts before unmounting the main mount point */
+	unmount_bind_mounts(mnt);
 
 do_unmount:
 	if (geteuid() == 0)
