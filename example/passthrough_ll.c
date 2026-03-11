@@ -47,6 +47,7 @@
 #include <inttypes.h>
 #include <pthread.h>
 #include <sys/file.h>
+#include <sys/resource.h>
 #include <sys/xattr.h>
 
 #include "passthrough_helpers.h"
@@ -67,10 +68,13 @@ struct _uintptr_to_must_hold_fuse_ino_t_dummy_struct \
 struct lo_inode {
 	struct lo_inode *next; /* protected by lo->mutex */
 	struct lo_inode *prev; /* protected by lo->mutex */
+	struct lo_inode *lru_next; /* LRU list, protected by lo->mutex */
+	struct lo_inode *lru_prev; /* LRU list, protected by lo->mutex */
 	int fd;
 	ino_t ino;
 	dev_t dev;
 	uint64_t refcount; /* protected by lo->mutex */
+	char *path; /* path from source root for reopening, NULL for root */
 };
 
 enum {
@@ -90,6 +94,9 @@ struct lo_data {
 	int cache;
 	int timeout_set;
 	struct lo_inode root; /* protected by lo->mutex */
+	struct lo_inode lru_head; /* LRU list sentinel, protected by lo->mutex */
+	rlim_t max_fds; /* fd limit from getrlimit */
+	size_t open_fd_count; /* number of currently open inode fds */
 };
 
 static const struct fuse_opt lo_opts[] = {
@@ -151,14 +158,114 @@ static struct lo_inode *lo_inode(fuse_req_t req, fuse_ino_t ino)
 		return (struct lo_inode *) (uintptr_t) ino;
 }
 
-static int lo_fd(fuse_req_t req, fuse_ino_t ino)
-{
-	return lo_inode(req, ino)->fd;
-}
-
 static bool lo_debug(fuse_req_t req)
 {
 	return lo_data(req)->debug != 0;
+}
+
+/* LRU list operations — must hold lo->mutex */
+
+static void lru_remove(struct lo_inode *inode)
+{
+	if (!inode->lru_next)
+		return;
+	inode->lru_prev->lru_next = inode->lru_next;
+	inode->lru_next->lru_prev = inode->lru_prev;
+	inode->lru_next = inode->lru_prev = NULL;
+}
+
+static void lru_insert_head(struct lo_data *lo, struct lo_inode *inode)
+{
+	struct lo_inode *first = lo->lru_head.lru_next;
+	inode->lru_next = first;
+	inode->lru_prev = &lo->lru_head;
+	first->lru_prev = inode;
+	lo->lru_head.lru_next = inode;
+}
+
+static void lru_touch(struct lo_data *lo, struct lo_inode *inode)
+{
+	lru_remove(inode);
+	lru_insert_head(lo, inode);
+}
+
+/* Evict least-recently-used fds until below 90% capacity.
+   Must hold lo->mutex. */
+static void lo_evict_fds_locked(struct lo_data *lo)
+{
+	rlim_t threshold = lo->max_fds * 9 / 10;
+
+	while (lo->open_fd_count >= threshold) {
+		struct lo_inode *victim = lo->lru_head.lru_prev;
+		if (victim == &lo->lru_head)
+			break;
+		lru_remove(victim);
+		close(victim->fd);
+		victim->fd = -1;
+		lo->open_fd_count--;
+	}
+}
+
+/* Reopen a closed inode fd using its stored path.
+   Must hold lo->mutex. Returns 0 on success, negative errno on error. */
+static int lo_reopen_locked(struct lo_data *lo, struct lo_inode *inode)
+{
+	int fd;
+	struct stat st;
+
+	if (inode->fd >= 0) {
+		if (inode->path)
+			lru_touch(lo, inode);
+		return 0;
+	}
+
+	if (!inode->path)
+		return -ENOENT;
+
+	lo_evict_fds_locked(lo);
+
+	fd = openat(lo->root.fd, inode->path, O_PATH | O_NOFOLLOW);
+	if (fd == -1)
+		return -errno;
+
+	if (fstatat(fd, "", &st, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) == -1 ||
+	    st.st_ino != inode->ino || st.st_dev != inode->dev) {
+		close(fd);
+		return -ESTALE;
+	}
+
+	inode->fd = fd;
+	lo->open_fd_count++;
+	lru_insert_head(lo, inode);
+	return 0;
+}
+
+/* Ensure inode has a valid fd. Returns fd >= 0 on success, -1 with errno set. */
+static int lo_inode_fd(struct lo_data *lo, struct lo_inode *inode)
+{
+	int err;
+
+	pthread_mutex_lock(&lo->mutex);
+	err = lo_reopen_locked(lo, inode);
+	pthread_mutex_unlock(&lo->mutex);
+
+	if (err) {
+		errno = -err;
+		return -1;
+	}
+	return inode->fd;
+}
+
+static int lo_fd(fuse_req_t req, fuse_ino_t ino)
+{
+	return lo_inode_fd(lo_data(req), lo_inode(req, ino));
+}
+
+static void lo_evict_if_needed(struct lo_data *lo)
+{
+	pthread_mutex_lock(&lo->mutex);
+	lo_evict_fds_locked(lo);
+	pthread_mutex_unlock(&lo->mutex);
 }
 
 static void lo_init(void *userdata,
@@ -194,7 +301,9 @@ static void lo_destroy(void *userdata)
 	while (lo->root.next != &lo->root) {
 		struct lo_inode* next = lo->root.next;
 		lo->root.next = next->next;
-		close(next->fd);
+		if (next->fd >= 0)
+			close(next->fd);
+		free(next->path);
 		free(next);
 	}
 }
@@ -205,9 +314,15 @@ static void lo_getattr(fuse_req_t req, fuse_ino_t ino,
 	int res;
 	struct stat buf;
 	struct lo_data *lo = lo_data(req);
-	int fd = fi ? fi->fh : lo_fd(req, ino);
+	int fd;
 
-	(void) fi;
+	if (fi) {
+		fd = fi->fh;
+	} else {
+		fd = lo_fd(req, ino);
+		if (fd < 0)
+			return (void) fuse_reply_err(req, errno);
+	}
 
 	res = fstatat(fd, "", &buf, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
 	if (res == -1)
@@ -221,9 +336,15 @@ static void lo_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr,
 {
 	int saverr;
 	char procname[64];
+	struct lo_data *lo = lo_data(req);
 	struct lo_inode *inode = lo_inode(req, ino);
-	int ifd = inode->fd;
+	int ifd = lo_inode_fd(lo, inode);
 	int res;
+
+	if (ifd < 0) {
+		fuse_reply_err(req, errno);
+		return;
+	}
 
 	if (valid & FUSE_SET_ATTR_MODE) {
 		if (fi) {
@@ -310,7 +431,8 @@ static struct lo_inode *lo_find(struct lo_data *lo, struct stat *st)
 }
 
 
-static struct lo_inode *create_new_inode(int fd, struct fuse_entry_param *e, struct lo_data* lo)
+static struct lo_inode *create_new_inode(int fd, struct fuse_entry_param *e,
+					 struct lo_data *lo, const char *path)
 {
 	struct lo_inode *inode = NULL;
 	struct lo_inode *prev, *next;
@@ -323,6 +445,7 @@ static struct lo_inode *create_new_inode(int fd, struct fuse_entry_param *e, str
 	inode->fd = fd;
 	inode->ino = e->attr.st_ino;
 	inode->dev = e->attr.st_dev;
+	inode->path = path ? strdup(path) : NULL;
 
 	pthread_mutex_lock(&lo->mutex);
 	prev = &lo->root;
@@ -331,6 +454,10 @@ static struct lo_inode *create_new_inode(int fd, struct fuse_entry_param *e, str
 	inode->next = next;
 	inode->prev = prev;
 	prev->next = inode;
+
+	lo->open_fd_count++;
+	if (inode->path)
+		lru_insert_head(lo, inode);
 	pthread_mutex_unlock(&lo->mutex);
 	return inode;
 }
@@ -348,7 +475,7 @@ static int fill_entry_param_new_inode(fuse_req_t req, fuse_ino_t parent, int fd,
 	if (res == -1)
 		return errno;
 
-	e->ino = (uintptr_t) create_new_inode(dup(fd), e, lo);
+	e->ino = (uintptr_t) create_new_inode(dup(fd), e, lo, NULL);
 
 	if (lo_debug(req))
 		fuse_log(FUSE_LOG_DEBUG, "  %lli/%d -> %lli\n",
@@ -361,17 +488,37 @@ static int fill_entry_param_new_inode(fuse_req_t req, fuse_ino_t parent, int fd,
 static int lo_do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
 			 struct fuse_entry_param *e)
 {
-	int newfd;
+	int newfd = -1;
 	int res;
 	int saverr;
 	struct lo_data *lo = lo_data(req);
 	struct lo_inode *inode;
+	struct lo_inode *parent_inode = lo_inode(req, parent);
+	char *path = NULL;
+	int parent_fd;
 
 	memset(e, 0, sizeof(*e));
 	e->attr_timeout = lo->timeout;
 	e->entry_timeout = lo->timeout;
 
-	newfd = openat(lo_fd(req, parent), name, O_PATH | O_NOFOLLOW);
+	/* Build path for potential reopening later */
+	if (parent_inode->path)
+		asprintf(&path, "%s/%s", parent_inode->path, name);
+	else
+		path = strdup(name);
+	if (!path) {
+		errno = ENOMEM;
+		goto out_err;
+	}
+
+	/* Evict before opening a new fd */
+	lo_evict_if_needed(lo);
+
+	parent_fd = lo_inode_fd(lo, parent_inode);
+	if (parent_fd < 0)
+		goto out_err;
+
+	newfd = openat(parent_fd, name, O_PATH | O_NOFOLLOW);
 	if (newfd == -1)
 		goto out_err;
 
@@ -383,8 +530,15 @@ static int lo_do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
 	if (inode) {
 		close(newfd);
 		newfd = -1;
+
+		/* Update stored path in case of rename */
+		pthread_mutex_lock(&lo->mutex);
+		free(inode->path);
+		inode->path = path;
+		path = NULL;
+		pthread_mutex_unlock(&lo->mutex);
 	} else {
-		inode = create_new_inode(newfd, e, lo);
+		inode = create_new_inode(newfd, e, lo, path);
 		if (!inode)
 			goto out_err;
 	}
@@ -394,12 +548,14 @@ static int lo_do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
 		fuse_log(FUSE_LOG_DEBUG, "  %lli/%s -> %lli\n",
 			(unsigned long long) parent, name, (unsigned long long) e->ino);
 
+	free(path);
 	return 0;
 
 out_err:
 	saverr = errno;
 	if (newfd != -1)
 		close(newfd);
+	free(path);
 	return saverr;
 }
 
@@ -425,10 +581,17 @@ static void lo_mknod_symlink(fuse_req_t req, fuse_ino_t parent,
 {
 	int res;
 	int saverr;
+	struct lo_data *lo = lo_data(req);
 	struct lo_inode *dir = lo_inode(req, parent);
+	int dfd = lo_inode_fd(lo, dir);
 	struct fuse_entry_param e;
 
-	res = mknod_wrapper(dir->fd, name, link, mode, rdev);
+	if (dfd < 0) {
+		fuse_reply_err(req, errno);
+		return;
+	}
+
+	res = mknod_wrapper(dfd, name, link, mode, rdev);
 
 	saverr = errno;
 	if (res == -1)
@@ -476,18 +639,30 @@ static void lo_link(fuse_req_t req, fuse_ino_t ino, fuse_ino_t parent,
 	struct fuse_entry_param e;
 	char procname[64];
 	int saverr;
+	int ifd = lo_inode_fd(lo, inode);
+	int pfd;
+
+	if (ifd < 0) {
+		fuse_reply_err(req, errno);
+		return;
+	}
+	pfd = lo_fd(req, parent);
+	if (pfd < 0) {
+		fuse_reply_err(req, errno);
+		return;
+	}
 
 	memset(&e, 0, sizeof(struct fuse_entry_param));
 	e.attr_timeout = lo->timeout;
 	e.entry_timeout = lo->timeout;
 
-	sprintf(procname, "/proc/self/fd/%i", inode->fd);
-	res = linkat(AT_FDCWD, procname, lo_fd(req, parent), name,
+	sprintf(procname, "/proc/self/fd/%i", ifd);
+	res = linkat(AT_FDCWD, procname, pfd, name,
 		     AT_SYMLINK_FOLLOW);
 	if (res == -1)
 		goto out_err;
 
-	res = fstatat(inode->fd, "", &e.attr, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
+	res = fstatat(ifd, "", &e.attr, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
 	if (res == -1)
 		goto out_err;
 
@@ -560,8 +735,14 @@ static void unref_inode(struct lo_data *lo, struct lo_inode *inode, uint64_t n)
 		next->prev = prev;
 		prev->next = next;
 
+		lru_remove(inode);
+		if (inode->fd >= 0)
+			lo->open_fd_count--;
+
 		pthread_mutex_unlock(&lo->mutex);
-		close(inode->fd);
+		if (inode->fd >= 0)
+			close(inode->fd);
+		free(inode->path);
 		free(inode);
 
 	} else {
@@ -898,7 +1079,10 @@ static void lo_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 	if (lo->writeback && (fi->flags & O_APPEND))
 		fi->flags &= ~O_APPEND;
 
-	sprintf(buf, "/proc/self/fd/%i", lo_fd(req, ino));
+	int ifd = lo_fd(req, ino);
+	if (ifd < 0)
+		return (void) fuse_reply_err(req, errno);
+	sprintf(buf, "/proc/self/fd/%i", ifd);
 	fd = open(buf, fi->flags & ~O_NOFOLLOW);
 	if (fd == -1)
 		return (void) fuse_reply_err(req, errno);
@@ -1029,12 +1213,14 @@ static void lo_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 {
 	char *value = NULL;
 	char procname[64];
+	struct lo_data *lo = lo_data(req);
 	struct lo_inode *inode = lo_inode(req, ino);
 	ssize_t ret;
 	int saverr;
+	int ifd;
 
 	saverr = ENOSYS;
-	if (!lo_data(req)->xattr)
+	if (!lo->xattr)
 		goto out;
 
 	if (lo_debug(req)) {
@@ -1042,7 +1228,10 @@ static void lo_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 			ino, name, size);
 	}
 
-	sprintf(procname, "/proc/self/fd/%i", inode->fd);
+	ifd = lo_inode_fd(lo, inode);
+	if (ifd < 0)
+		goto out_err;
+	sprintf(procname, "/proc/self/fd/%i", ifd);
 
 	if (size) {
 		value = malloc(size);
@@ -1079,12 +1268,14 @@ static void lo_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 {
 	char *value = NULL;
 	char procname[64];
+	struct lo_data *lo = lo_data(req);
 	struct lo_inode *inode = lo_inode(req, ino);
 	ssize_t ret;
 	int saverr;
+	int ifd;
 
 	saverr = ENOSYS;
-	if (!lo_data(req)->xattr)
+	if (!lo->xattr)
 		goto out;
 
 	if (lo_debug(req)) {
@@ -1092,7 +1283,10 @@ static void lo_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
 			ino, size);
 	}
 
-	sprintf(procname, "/proc/self/fd/%i", inode->fd);
+	ifd = lo_inode_fd(lo, inode);
+	if (ifd < 0)
+		goto out_err;
+	sprintf(procname, "/proc/self/fd/%i", ifd);
 
 	if (size) {
 		value = malloc(size);
@@ -1129,12 +1323,14 @@ static void lo_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 			const char *value, size_t size, int flags)
 {
 	char procname[64];
+	struct lo_data *lo = lo_data(req);
 	struct lo_inode *inode = lo_inode(req, ino);
 	ssize_t ret;
 	int saverr;
+	int ifd;
 
 	saverr = ENOSYS;
-	if (!lo_data(req)->xattr)
+	if (!lo->xattr)
 		goto out;
 
 	if (lo_debug(req)) {
@@ -1142,11 +1338,17 @@ static void lo_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
 			ino, name, value, size);
 	}
 
-	sprintf(procname, "/proc/self/fd/%i", inode->fd);
+	ifd = lo_inode_fd(lo, inode);
+	if (ifd < 0)
+		goto out_err;
+	sprintf(procname, "/proc/self/fd/%i", ifd);
 
 	ret = setxattr(procname, name, value, size, flags);
 	saverr = ret == -1 ? errno : 0;
+	goto out;
 
+out_err:
+	saverr = errno;
 out:
 	fuse_reply_err(req, saverr);
 }
@@ -1154,12 +1356,14 @@ out:
 static void lo_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name)
 {
 	char procname[64];
+	struct lo_data *lo = lo_data(req);
 	struct lo_inode *inode = lo_inode(req, ino);
 	ssize_t ret;
 	int saverr;
+	int ifd;
 
 	saverr = ENOSYS;
-	if (!lo_data(req)->xattr)
+	if (!lo->xattr)
 		goto out;
 
 	if (lo_debug(req)) {
@@ -1167,11 +1371,17 @@ static void lo_removexattr(fuse_req_t req, fuse_ino_t ino, const char *name)
 			ino, name);
 	}
 
-	sprintf(procname, "/proc/self/fd/%i", inode->fd);
+	ifd = lo_inode_fd(lo, inode);
+	if (ifd < 0)
+		goto out_err;
+	sprintf(procname, "/proc/self/fd/%i", ifd);
 
 	ret = removexattr(procname, name);
 	saverr = ret == -1 ? errno : 0;
+	goto out;
 
+out_err:
+	saverr = errno;
 out:
 	fuse_reply_err(req, saverr);
 }
@@ -1299,7 +1509,18 @@ int main(int argc, char *argv[])
 	pthread_mutex_init(&lo.mutex, NULL);
 	lo.root.next = lo.root.prev = &lo.root;
 	lo.root.fd = -1;
+	lo.root.path = NULL;
+	lo.root.lru_next = lo.root.lru_prev = NULL;
+	lo.lru_head.lru_next = lo.lru_head.lru_prev = &lo.lru_head;
 	lo.cache = CACHE_NORMAL;
+
+	/* Get fd limit for LRU eviction threshold */
+	struct rlimit rl;
+	if (getrlimit(RLIMIT_NOFILE, &rl) == 0)
+		lo.max_fds = rl.rlim_cur;
+	else
+		lo.max_fds = 1024;
+	lo.open_fd_count = 0;
 
 	if (fuse_parse_cmdline(&args, &opts) != 0)
 		return 1;
@@ -1377,6 +1598,7 @@ int main(int argc, char *argv[])
 			 lo.source);
 		exit(1);
 	}
+	lo.open_fd_count = 1;
 
 	se = fuse_session_new(&args, &lo_oper, sizeof(lo_oper), &lo);
 	if (se == NULL)
