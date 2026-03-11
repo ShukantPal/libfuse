@@ -837,12 +837,42 @@ static void *fuse_uring_thread(void *arg)
 
 	/* Not using fuse_session_exited(se), as that cannot be inlined */
 	while (!atomic_load_explicit(&se->mt_exited, memory_order_relaxed)) {
-		io_uring_submit_and_wait(&queue->ring, 1);
+		struct io_uring_cqe *cqe;
+		int ret;
+
+		/*
+		 * Split io_uring_submit_and_wait() into separate submit and
+		 * wait calls to fix a race condition with concurrent SQE
+		 * submission from reply threads (issue #1443).
+		 *
+		 * io_uring_submit() modifies the SQ ring and must be
+		 * serialized with io_uring_get_sqe()/io_uring_submit() calls
+		 * in fuse_uring_commit_sqe() from other threads.
+		 *
+		 * io_uring_wait_cqe() only reads the CQ ring (written
+		 * exclusively by the kernel) and is safe without the lock.
+		 */
+		pthread_mutex_lock(&queue->ring_lock);
+		io_uring_submit(&queue->ring);
+		pthread_mutex_unlock(&queue->ring_lock);
+
+		ret = io_uring_wait_cqe(&queue->ring, &cqe);
+		if (ret < 0) {
+			if (ret == -EINTR || ret == -EAGAIN)
+				continue;
+			err = ret;
+			goto err;
+		}
 
 		pthread_mutex_lock(&queue->ring_lock);
 		queue->cqe_processing = true;
 		err = fuse_uring_queue_handle_cqes(queue);
 		queue->cqe_processing = false;
+
+		/* Submit any SQEs queued during CQE processing (resubmits
+		 * and synchronous replies skip submission when
+		 * cqe_processing is set) */
+		io_uring_submit(&queue->ring);
 		pthread_mutex_unlock(&queue->ring_lock);
 		if (err < 0)
 			goto err;
