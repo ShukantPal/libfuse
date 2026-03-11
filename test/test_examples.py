@@ -1169,5 +1169,36 @@ def test_printcap_has_all_fuse_caps():
         assert False, "\n".join(msg)
 
 
+def test_hello_ll_root_xattr(tmpdir, output_checker):
+    """Regression test for issue #836: getxattr on root directory (inode 1)
+    must not crash hello_ll. The original code used assert() which would
+    abort the process; the fix returns proper error codes instead."""
+    mnt_dir = str(tmpdir)
+    cmdline = invoke_directly(mnt_dir, 'hello_ll', ())
+    mount_process = subprocess.Popen(
+        cmdline,
+        stdout=output_checker.fd, stderr=output_checker.fd)
+    try:
+        wait_for_mount(mount_process, mnt_dir)
+
+        # Test xattr operations on root directory (inode 1).
+        # Without the fix, assert() in the xattr handlers could crash
+        # the filesystem process with SIGABRT.
+        tst_xattr(mnt_dir)
+
+        # Also test with an unknown xattr name to exercise error paths
+        with pytest.raises(OSError) as exc_info:
+            os.getxattr(mnt_dir, b'user.nonexistent')
+        assert exc_info.value.errno == errno.ENOTSUP
+
+        # Verify filesystem is still alive after xattr operations
+        assert os.listdir(mnt_dir) == ['hello']
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
 # avoid warning about unused import
 assert test_printcap
