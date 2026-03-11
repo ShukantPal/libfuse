@@ -1169,5 +1169,68 @@ def test_printcap_has_all_fuse_caps():
         assert False, "\n".join(msg)
 
 
+def test_passthrough_ll_readdir_offset(short_tmpdir, output_checker):
+    """Regression test for issue #401.
+
+    passthrough_ll used d_off for readdir offset tracking, but on FreeBSD
+    (and other non-Linux platforms) d_off is not reliable for seekdir.
+    The fix uses telldir() on non-Linux platforms. This test creates enough
+    files to force multi-page readdir and verifies no entries are skipped.
+
+    Note: On Linux, d_off happens to work correctly so the bug does not
+    manifest. This test still validates correct readdir behavior.
+    """
+    mnt_dir = str(short_tmpdir.mkdir('mnt'))
+    src_dir = str(short_tmpdir.mkdir('src'))
+
+    cmdline = base_cmdline + \
+              [ pjoin(basename, 'example', 'passthrough_ll'),
+                '-f', mnt_dir, '-o', 'timeout=0' ]
+
+    mount_process = subprocess.Popen(cmdline, stdout=output_checker.fd,
+                                     stderr=output_checker.fd)
+    try:
+        wait_for_mount(mount_process, mnt_dir)
+        work_dir = mnt_dir + src_dir
+
+        # Create a subdirectory with many files to force multi-page readdir.
+        # Use long filenames to fill up the readdir buffer faster.
+        subdir_name = 'readdir_offset_test'
+        src_subdir = pjoin(src_dir, subdir_name)
+        mnt_subdir = pjoin(work_dir, subdir_name)
+        os.mkdir(src_subdir)
+
+        num_files = 500
+        expected_names = set()
+        for i in range(num_files):
+            fname = 'testfile_%04d_padding_to_make_name_longer' % i
+            with open(pjoin(src_subdir, fname), 'w') as fh:
+                fh.write('data_%d' % i)
+            expected_names.add(fname)
+
+        # Read directory listing via FUSE mount
+        actual_names = set(os.listdir(mnt_subdir))
+
+        # Verify no entries were skipped
+        missing = expected_names - actual_names
+        extra = actual_names - expected_names
+        assert not missing, \
+            'readdir skipped %d entries (issue #401): %s' % (len(missing), sorted(missing)[:10])
+        assert not extra, \
+            'readdir returned %d unexpected entries: %s' % (len(extra), sorted(extra)[:10])
+        assert len(actual_names) == num_files
+
+        # Cleanup
+        for fname in expected_names:
+            os.unlink(pjoin(src_subdir, fname))
+        os.rmdir(src_subdir)
+
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
 # avoid warning about unused import
 assert test_printcap
