@@ -1056,5 +1056,90 @@ def tst_xattr(path):
     os.removexattr(path, b'hello_ll_removexattr_name')
 
 
+def test_memfs_ll_oob_overflow(tmpdir, output_checker):
+    """Regression test for issue #1339: OOB read/write in memfs_ll.cc.
+
+    Tests the bounds checks added to Inode::read_content and
+    Inode::write_content to prevent integer overflow / unsigned
+    underflow leading to out-of-bounds memory access.
+
+    Part 1: Run a C++ unit test that directly calls the Inode
+    methods with edge-case values (offset > content size).
+    Without the fix, this crashes with SIGSEGV.
+
+    Part 2: Mount memfs_ll via FUSE and verify basic read/write
+    operations at various offsets work correctly.
+    """
+
+    # Part 1: C++ unit test for the overflow checks
+    test_bin = pjoin(basename, 'test', 'test_memfs_overflow')
+    if not os.path.exists(test_bin):
+        pytest.skip('test_memfs_overflow not built')
+
+    result = subprocess.run([test_bin], capture_output=True, text=True,
+                            timeout=10)
+    assert result.returncode == 0, \
+        'memfs_ll overflow unit test failed (exit %d): %s' % (
+            result.returncode, result.stderr)
+
+    # Part 2: FUSE integration test
+    progname = pjoin(basename, 'example', 'memfs_ll')
+    if not os.path.exists(progname):
+        pytest.skip('memfs_ll not built')
+
+    mnt_dir = str(tmpdir)
+    cmdline = base_cmdline + [progname, '-f', mnt_dir]
+    mount_process = subprocess.Popen(cmdline, stdout=output_checker.fd,
+                                     stderr=output_checker.fd)
+    try:
+        wait_for_mount(mount_process, mnt_dir)
+
+        testfile = pjoin(mnt_dir, 'testfile')
+
+        # Write data and read it back
+        test_data = b'A' * 4096
+        with open(testfile, 'wb') as fh:
+            fh.write(test_data)
+        with open(testfile, 'rb') as fh:
+            assert fh.read() == test_data
+
+        # Read at various offsets within bounds
+        fd = os.open(testfile, os.O_RDONLY)
+        assert os.pread(fd, 10, 0) == test_data[:10]
+        assert os.pread(fd, 10, 4090) == test_data[4090:4096]
+
+        # Read past EOF should return empty
+        assert os.pread(fd, 10, 4096) == b''
+        assert os.pread(fd, 10, 8192) == b''
+        os.close(fd)
+
+        # Write at a moderate offset and verify
+        fd = os.open(testfile, os.O_WRONLY)
+        os.pwrite(fd, b'XY', 8192)
+        os.close(fd)
+
+        fd = os.open(testfile, os.O_RDONLY)
+        # File should now be 8194 bytes (sparse-like via vector resize)
+        data = os.pread(fd, 8194, 0)
+        assert len(data) == 8194
+        assert data[:4096] == test_data
+        assert data[4096:8192] == b'\x00' * 4096
+        assert data[8192:] == b'XY'
+        os.close(fd)
+
+        # Verify filesystem is still functional after edge-case ops
+        testfile2 = pjoin(mnt_dir, 'testfile2')
+        with open(testfile2, 'wb') as fh:
+            fh.write(b'still works')
+        with open(testfile2, 'rb') as fh:
+            assert fh.read() == b'still works'
+
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
 # avoid warning about unused import
 assert test_printcap
