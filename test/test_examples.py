@@ -1169,5 +1169,34 @@ def test_printcap_has_all_fuse_caps():
         assert False, "\n".join(msg)
 
 
+def test_unlink_node_nlookup():
+    """Regression test for issue #589: assert(node->nlookup > 1) in unlink_node.
+
+    With the 'remember' option, a race condition between FORGET and UNLINK
+    (e.g. during NFS re-export) can cause nlookup to be <= 1 when
+    unlink_node is called. The old code had assert(node->nlookup > 1)
+    which would SIGABRT the process. The fix replaces the assert with a
+    warning log.
+
+    This test runs the nlookup_race C unit test which replicates the
+    unlink_node logic and calls it with nlookup=1. The build system
+    detects whether the fix is applied and compiles the matching code
+    path. Without the fix, the test crashes with SIGABRT. With the fix,
+    the test passes.
+    """
+    progname = pjoin(basename, 'test', 'nlookup_race')
+    if not os.path.exists(progname):
+        pytest.skip('%s not built' % os.path.basename(progname))
+
+    result = subprocess.run([progname], capture_output=True, timeout=10)
+    if result.returncode != 0:
+        pytest.fail(
+            'nlookup_race test failed (exit code %d).\n'
+            'stdout: %s\nstderr: %s' % (
+                result.returncode,
+                result.stdout.decode(errors='replace'),
+                result.stderr.decode(errors='replace')))
+
+
 # avoid warning about unused import
 assert test_printcap

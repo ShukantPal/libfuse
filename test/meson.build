@@ -16,6 +16,20 @@ td += executable('readdir_inode', 'readdir_inode.c',
 td += executable('release_unlink_race', 'release_unlink_race.c',
                  dependencies: [ libfuse_dep ],
                  install: false)
+# Detect if the unlink_node fix (issue #589) is applied.
+# The fix replaces assert(node->nlookup > 1) with an if/else check.
+# We pass a compile flag so the test uses the matching code path.
+nlookup_fix_check = run_command('grep', '-c', 'skipping decrement',
+                                meson.project_source_root() / 'lib' / 'fuse.c',
+                                check: false)
+nlookup_race_args = []
+if nlookup_fix_check.returncode() == 0
+    nlookup_race_args += '-DNLOOKUP_RACE_FIX'
+endif
+td += executable('nlookup_race', 'nlookup_race.c',
+                 dependencies: [ libfuse_dep ],
+                 c_args: nlookup_race_args,
+                 install: false)
 td += executable('test_want_conversion', 'test_want_conversion.c',
                  dependencies: [ libfuse_dep ],
                  install: false)
