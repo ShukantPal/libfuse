@@ -152,19 +152,24 @@ class Inode {
 
 	void read_content(char *buf, size_t size, off_t offset) const
 	{
+		if ((size_t)offset >= content.size())
+			return;
 		size_t bytes_to_read = std::min(size, content.size() - (size_t)offset);
 		std::copy(content.begin() + offset,
 			  content.begin() + offset + bytes_to_read, buf);
 	}
 
-	void write_content(const char *buf, size_t size, off_t offset)
+	int write_content(const char *buf, size_t size, off_t offset)
 	{
 		std::lock_guard<std::mutex> lock(mutex);
-		if (offset + size > content.size()) {
-			content.resize(offset + size);
+		if ((size_t)offset > SIZE_MAX - size)
+			return -EINVAL;
+		if ((size_t)offset + size > content.size()) {
+			content.resize((size_t)offset + size);
 		}
 		std::copy(buf, buf + size, content.begin() + offset);
 		mtime = time(NULL);
+		return 0;
 	}
 
 	void set_uid(uid_t _uid)
@@ -592,7 +597,11 @@ static void memfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf,
 		return;
 	}
 
-	inode->write_content(buf, size, offset);
+	int ret = inode->write_content(buf, size, offset);
+	if (ret < 0) {
+		fuse_reply_err(req, -ret);
+		return;
+	}
 	fuse_reply_write(req, size);
 }
 
