@@ -715,7 +715,11 @@ static void lo_do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size,
 				}
 			}
 		}
+#ifdef __linux__
 		nextoff = d->entry->d_off;
+#else
+		nextoff = telldir(d->dp);
+#endif
 		name = d->entry->d_name;
 		fuse_ino_t entry_ino = 0;
 		if (plus) {
