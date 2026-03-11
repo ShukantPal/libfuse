@@ -740,15 +740,34 @@ struct fuse_operations {
 	/**
 	 * Ioctl
 	 *
-	 * flags will have FUSE_IOCTL_COMPAT set for 32bit ioctls in
-	 * 64bit environment.  The size and direction of data is
-	 * determined by _IOC_*() decoding of cmd.  For _IOC_NONE,
-	 * data will be NULL, for _IOC_WRITE data is out area, for
-	 * _IOC_READ in area and if both are set in/out area.  In all
-	 * non-NULL cases, the area is of _IOC_SIZE(cmd) bytes.
+	 * The high-level ioctl handler only supports restricted ioctls.
+	 * Unrestricted ioctls (FUSE_IOCTL_UNRESTRICTED) are rejected
+	 * with -EPERM; they are only available via the low-level API
+	 * for CUSE servers.
 	 *
-	 * If flags has FUSE_IOCTL_DIR then the fuse_file_info refers to a
-	 * directory file handle.
+	 * The kernel decodes @cmd using the _IOC_*() macros to
+	 * determine the data transfer direction and size, then
+	 * provides the data buffer in @data:
+	 *   - _IOC_NONE: @data is NULL, no data transfer
+	 *   - _IOC_WRITE (user->fs): @data points to _IOC_SIZE(cmd)
+	 *     bytes of input from the calling process
+	 *   - _IOC_READ (fs->user): @data points to a buffer of
+	 *     _IOC_SIZE(cmd) bytes for the handler to fill with
+	 *     output to return to the caller
+	 *   - _IOC_READ|_IOC_WRITE: @data points to a buffer of
+	 *     _IOC_SIZE(cmd) bytes pre-filled with input; the handler
+	 *     should overwrite it with output
+	 *
+	 * @arg is the raw value passed by the calling process to the
+	 * ioctl() system call (the third argument), cast to void *.
+	 * It is typically a user-space pointer, but the FUSE server
+	 * MUST NOT dereference it — it belongs to the caller's
+	 * address space.  The actual data is always provided via
+	 * @data; @arg is only meaningful as an opaque token.
+	 *
+	 * flags will have FUSE_IOCTL_COMPAT set for 32bit ioctls in
+	 * 64bit environment.  If flags has FUSE_IOCTL_DIR then the
+	 * fuse_file_info refers to a directory file handle.
 	 *
 	 * Note : the unsigned long request submitted by the application
 	 * is truncated to 32 bits.
