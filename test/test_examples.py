@@ -1169,5 +1169,87 @@ def test_printcap_has_all_fuse_caps():
         assert False, "\n".join(msg)
 
 
+def _is_mount_in_mountinfo(path):
+    """Check if path appears as a mount point in /proc/self/mountinfo."""
+    with open('/proc/self/mountinfo', 'r') as f:
+        for line in f:
+            fields = line.split()
+            if len(fields) >= 5:
+                mp = fields[4]
+                # Unescape \NNN octal sequences used in mountinfo
+                mp = re.sub(r'\\([0-7]{3})',
+                            lambda m: chr(int(m.group(1), 8)), mp)
+                if mp == path:
+                    return True
+    return False
+
+
+@pytest.mark.skipif(os.getuid() != 0,
+                    reason='bind mount cleanup test requires root')
+def test_auto_unmount_cleans_bind_mounts(short_tmpdir, output_checker):
+    """Regression test for issue #889: bind mounts persist after auto_unmount.
+
+    When a FUSE process dies with auto_unmount enabled, bind mounts
+    originating from the FUSE filesystem should be cleaned up, not
+    left in 'Transport endpoint is not connected' state.
+    """
+
+    mnt_dir = str(short_tmpdir.mkdir('mnt'))
+    src_dir = str(short_tmpdir.mkdir('src'))
+    bind_target = str(short_tmpdir.mkdir('bind_target'))
+
+    # Create a subdirectory in source that we will bind mount
+    os.mkdir(pjoin(src_dir, 'subdir'))
+
+    # Mount passthrough_ll with auto_unmount
+    cmdline = base_cmdline + \
+              [ pjoin(basename, 'example', 'passthrough_ll'),
+                '-o', f'source={src_dir},auto_unmount',
+                '-f', mnt_dir ]
+
+    mount_process = subprocess.Popen(cmdline, stdout=output_checker.fd,
+                                     stderr=output_checker.fd)
+    bind_mounted = False
+    try:
+        wait_for_mount(mount_process, mnt_dir)
+
+        # Create a bind mount from the FUSE filesystem
+        subprocess.check_call(['mount', '--bind',
+                               pjoin(mnt_dir, 'subdir'), bind_target])
+        bind_mounted = True
+        assert _is_mount_in_mountinfo(bind_target), \
+            "Bind mount was not created"
+
+        # Kill the FUSE process to trigger auto_unmount
+        mount_process.kill()
+        mount_process.wait()
+
+        # Wait for auto_unmount to complete (up to 10 seconds)
+        elapsed = 0
+        while elapsed < 10:
+            if not _is_mount_in_mountinfo(bind_target) and \
+               not _is_mount_in_mountinfo(mnt_dir):
+                break
+            time.sleep(0.1)
+            elapsed += 0.1
+
+        # Without the fix for issue #889, the bind mount remains
+        # in mountinfo in a broken state (ENOTCONN when accessed)
+        assert not _is_mount_in_mountinfo(bind_target), \
+            "Bind mount was not cleaned up during auto_unmount (issue #889)"
+
+    except:
+        if bind_mounted:
+            subprocess.call(['umount', '-l', bind_target],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if mount_process.poll() is None:
+            cleanup(mount_process, mnt_dir)
+        else:
+            subprocess.call([pjoin(basename, 'util', 'fusermount3'),
+                            '-z', '-u', mnt_dir],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        raise
+
+
 # avoid warning about unused import
 assert test_printcap
