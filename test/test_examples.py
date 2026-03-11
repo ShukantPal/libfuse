@@ -16,6 +16,7 @@ import filecmp
 import tempfile
 import time
 import errno
+import resource
 import sys
 import platform
 import re
@@ -1167,6 +1168,70 @@ def test_printcap_has_all_fuse_caps():
         if extra_caps:
             msg.append(f"Extra in printcap.c: {sorted(extra_caps)}")
         assert False, "\n".join(msg)
+
+
+def test_passthrough_ll_fd_exhaustion(short_tmpdir, output_checker):
+    """Regression test for issue #1131: passthrough_ll fd exhaustion on large trees.
+
+    Without the LRU fd cache fix, passthrough_ll keeps an O_PATH fd open for
+    every inode and never closes them, hitting EMFILE when the process fd limit
+    is reached. The fix adds an LRU cache that evicts least-recently-used fds.
+
+    This test sets a low fd limit on the FUSE process and creates more
+    directories than the limit allows, verifying that operations still succeed.
+    """
+    mnt_dir = str(short_tmpdir.mkdir('mnt'))
+    src_dir = str(short_tmpdir.mkdir('src'))
+    fd_limit = 256
+
+    def set_fd_limit():
+        resource.setrlimit(resource.RLIMIT_NOFILE, (fd_limit, fd_limit))
+
+    # Use a large timeout so the kernel keeps all inodes cached and
+    # doesn't send FORGET requests. With timeout=0 the kernel recycles
+    # inodes eagerly and the fd count never grows large enough to trigger
+    # the bug.
+    cmdline = base_cmdline + \
+              [ pjoin(basename, 'example', 'passthrough_ll'),
+                '-f', mnt_dir, '-o', 'timeout=60' ]
+
+    mount_process = subprocess.Popen(cmdline, stdout=output_checker.fd,
+                                     stderr=output_checker.fd,
+                                     preexec_fn=set_fd_limit)
+    try:
+        wait_for_mount(mount_process, mnt_dir)
+        work_dir = mnt_dir + src_dir
+
+        # Create more directories than the fd limit. Without the LRU cache
+        # fix, passthrough_ll opens an O_PATH fd per inode and never closes
+        # them, so it will hit EMFILE around directory ~244 (256 minus
+        # startup fds). With the fix, the LRU cache evicts at 90% capacity.
+        num_dirs = 400
+        for i in range(num_dirs):
+            d = pjoin(work_dir, 'dir_%04d' % i)
+            os.mkdir(d)
+
+        # Verify all directories are still accessible after exceeding the
+        # fd limit. With the fix, the LRU cache evicts old fds and reopens
+        # them on demand. Without the fix, the mkdir loop above would
+        # already have failed with EMFILE.
+        for i in range(num_dirs):
+            d = pjoin(work_dir, 'dir_%04d' % i)
+            st = os.stat(d)
+            assert stat.S_ISDIR(st.st_mode)
+
+        # Verify file I/O still works after heavy inode usage
+        test_file = pjoin(work_dir, 'testfile_after_exhaustion')
+        with open(test_file, 'w') as fh:
+            fh.write('hello')
+        with open(test_file, 'r') as fh:
+            assert fh.read() == 'hello'
+        os.unlink(test_file)
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
 
 
 # avoid warning about unused import
