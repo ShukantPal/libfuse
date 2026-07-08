@@ -1055,27 +1055,63 @@ struct fuse_lowlevel_ops {
 	/**
 	 * Ioctl
 	 *
-	 * Note: For unrestricted ioctls (not allowed for FUSE
-	 * servers), data in and out areas can be discovered by giving
-	 * iovs and setting FUSE_IOCTL_RETRY in *flags*.  For
-	 * restricted ioctls, kernel prepares in/out data area
-	 * according to the information encoded in cmd.
+	 * There are two modes of ioctl operation:
+	 *
+	 * 1. Restricted ioctls (the default for FUSE servers):
+	 *    The kernel decodes @cmd using the _IOC_*() macros to
+	 *    determine the data transfer direction and size.  It then
+	 *    automatically copies the data between the calling process
+	 *    and the FUSE server:
+	 *      - _IOC_WRITE (user->fs): data is provided in @in_buf
+	 *        (@in_bufsz bytes)
+	 *      - _IOC_READ (fs->user): server should reply with up to
+	 *        @out_bufsz bytes via fuse_reply_ioctl()
+	 *      - _IOC_READ|_IOC_WRITE: both @in_buf and @out_bufsz
+	 *        are set (in_bufsz == out_bufsz == _IOC_SIZE(cmd))
+	 *      - _IOC_NONE: no data transfer, @in_bufsz and
+	 *        @out_bufsz are both 0
+	 *    The server MUST NOT request FUSE_IOCTL_RETRY for
+	 *    restricted ioctls.
+	 *
+	 * 2. Unrestricted ioctls (FUSE_IOCTL_UNRESTRICTED, CUSE only):
+	 *    Not available for regular FUSE servers.  On the first
+	 *    call, @in_bufsz and @out_bufsz are 0.  The server uses
+	 *    fuse_reply_ioctl_retry() with iovec arrays referencing
+	 *    user-space addresses (derived from @arg) to tell the
+	 *    kernel which memory regions to fetch/prepare.  The kernel
+	 *    copies those regions and retries the ioctl.  This may
+	 *    repeat for pointer-chasing structures.
+	 *
+	 * @arg is the raw value passed by the calling process to the
+	 * ioctl() system call (the third argument), cast to void *.
+	 * It is typically a user-space pointer, but the FUSE server
+	 * MUST NOT dereference it — it belongs to the caller's address
+	 * space.  For restricted ioctls, the actual data is provided
+	 * in @in_buf; @arg is only useful as an opaque token.  For
+	 * unrestricted ioctls (CUSE), @arg is used as the base
+	 * address in iovec arrays passed to fuse_reply_ioctl_retry().
 	 *
 	 * Valid replies:
-	 *   fuse_reply_ioctl_retry
+	 *   fuse_reply_ioctl_retry (unrestricted ioctls only)
 	 *   fuse_reply_ioctl
 	 *   fuse_reply_ioctl_iov
 	 *   fuse_reply_err
 	 *
 	 * @param req request handle
 	 * @param ino the inode number
-	 * @param cmd ioctl command
-	 * @param arg ioctl argument
+	 * @param cmd ioctl command, encoding direction and size via
+	 *        _IOC_DIR/_IOC_SIZE
+	 * @param arg the raw ioctl argument from the calling process;
+	 *        not dereferenceable (see above)
 	 * @param fi file information
-	 * @param flags for FUSE_IOCTL_* flags
-	 * @param in_buf data fetched from the caller
-	 * @param in_bufsz number of fetched bytes
-	 * @param out_bufsz maximum size of output data
+	 * @param flags FUSE_IOCTL_* flags (e.g. FUSE_IOCTL_COMPAT,
+	 *        FUSE_IOCTL_UNRESTRICTED, FUSE_IOCTL_DIR)
+	 * @param in_buf data fetched from the caller (for
+	 *        _IOC_WRITE-direction ioctls)
+	 * @param in_bufsz number of fetched bytes (0 for _IOC_NONE
+	 *        or first call of unrestricted ioctls)
+	 * @param out_bufsz maximum size of output data (0 for
+	 *        _IOC_NONE or first call of unrestricted ioctls)
 	 *
 	 * Note : the unsigned long request submitted by the application
 	 * is truncated to 32 bits.
