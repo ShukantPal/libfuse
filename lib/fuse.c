@@ -1403,8 +1403,15 @@ static void forget_node(struct fuse *f, fuse_ino_t nodeid, uint64_t nlookup)
 static void unlink_node(struct fuse *f, struct node *node)
 {
 	if (f->conf.remember) {
-		assert(node->nlookup > 1);
-		node->nlookup--;
+		if (node->nlookup > 1)
+			node->nlookup--;
+		else
+			fuse_log(FUSE_LOG_WARNING,
+				 "fuse: nlookup (%llu) <= 1 in unlink_node "
+				 "(nodeid %llu), skipping decrement. "
+				 "This may happen when using NFS export.\n",
+				 (unsigned long long) node->nlookup,
+				 (unsigned long long) node->nodeid);
 	}
 	unhash_name(f, node);
 }
