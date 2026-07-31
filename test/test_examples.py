@@ -1169,5 +1169,91 @@ def test_printcap_has_all_fuse_caps():
         assert False, "\n".join(msg)
 
 
+def test_flush_null_path(short_tmpdir, output_checker):
+    """Test that flush on an unlinked file does not crash (GitHub issue #1188).
+
+    When a file is opened, unlinked, and then closed, the close triggers a
+    FUSE FLUSH request.  In fuse_lib_flush(), get_path_nullok() is called
+    to resolve the inode to a path.  Before the fix, the return value was
+    ignored and fuse_flush_common() was called unconditionally, passing a
+    potentially NULL path.  The fix checks the return value and only
+    proceeds when path resolution succeeds.
+
+    This test repeatedly opens files, unlinks them while the fd is still
+    open, then closes the fd (triggering flush).  Multiple iterations and
+    concurrent operations increase the likelihood of hitting the race
+    condition where get_path_nullok() fails during flush.
+    """
+    import threading
+
+    mnt_dir = str(short_tmpdir.mkdir('mnt'))
+    src_dir = str(short_tmpdir.mkdir('src'))
+
+    cmdline = base_cmdline + \
+              [ pjoin(basename, 'example', 'passthrough_fh'),
+                '-f', mnt_dir,
+                '-o', 'entry_timeout=0,negative_timeout=0,'
+                      'attr_timeout=0,ac_attr_timeout=0' ]
+
+    mount_process = subprocess.Popen(cmdline, stdout=output_checker.fd,
+                                     stderr=output_checker.fd)
+    try:
+        wait_for_mount(mount_process, mnt_dir)
+        work_dir = mnt_dir + src_dir
+
+        errors = []
+
+        def open_unlink_close(iteration):
+            """Open a file, unlink it, then close the fd (triggers flush)."""
+            try:
+                name = 'flush_test_%d' % iteration
+                testfile = pjoin(work_dir, name)
+                fd = os.open(testfile, os.O_CREAT | os.O_RDWR, 0o644)
+                os.write(fd, b'test data')
+                os.unlink(testfile)
+                # Close triggers FUSE_FLUSH then FUSE_RELEASE
+                os.close(fd)
+            except Exception as e:
+                errors.append(e)
+
+        # Run multiple iterations sequentially first
+        for i in range(10):
+            open_unlink_close(i)
+            assert mount_process.poll() is None, \
+                'FUSE daemon crashed during flush after unlink (issue #1188)'
+
+        # Also run concurrent open-unlink-close to stress the
+        # multi-threaded flush path
+        threads = []
+        for i in range(10, 30):
+            t = threading.Thread(target=open_unlink_close, args=(i,))
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        # Give the daemon a moment to process all closes
+        safe_sleep(0.5)
+
+        # The critical check: verify the mount process has not crashed
+        assert mount_process.poll() is None, \
+            'FUSE daemon crashed during flush after unlink (issue #1188)'
+        assert not errors, 'Errors during open-unlink-close: %s' % errors
+
+        # Verify the mount is still functional
+        verify_file = pjoin(work_dir, 'verify_alive')
+        with open(verify_file, 'w') as fh:
+            fh.write('still alive')
+        with open(verify_file, 'r') as fh:
+            assert fh.read() == 'still alive'
+        os.unlink(verify_file)
+
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
 # avoid warning about unused import
 assert test_printcap

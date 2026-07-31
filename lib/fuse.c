@@ -4175,9 +4175,11 @@ static void fuse_lib_flush(fuse_req_t req, fuse_ino_t ino,
 	char *path;
 	int err;
 
-	get_path_nullok(f, ino, &path);
-	err = fuse_flush_common(f, req, ino, path, fi);
-	free_path(f, ino, path);
+	err = get_path_nullok(f, ino, &path);
+	if (!err) {
+		err = fuse_flush_common(f, req, ino, path, fi);
+		free_path(f, ino, path);
+	}
 
 	reply_err(req, err);
 }
