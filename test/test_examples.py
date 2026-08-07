@@ -1169,5 +1169,77 @@ def test_printcap_has_all_fuse_caps():
         assert False, "\n".join(msg)
 
 
+def test_auto_cache_stale_size(short_tmpdir, output_checker):
+    """Regression test for issue #945.
+
+    When auto_cache is enabled and a file grows externally, open_auto_cache
+    must invalidate the kernel's cached inode so reads return the full new
+    content instead of being truncated to the stale cached size.
+    """
+    mnt_dir = str(short_tmpdir.mkdir('mnt'))
+    src_dir = str(short_tmpdir.mkdir('src'))
+
+    # Mount passthrough with auto_cache and large timeouts so the kernel
+    # caches inode attributes (including file size) and dentry entries.
+    # Set ac_attr_timeout=0 so open_auto_cache always re-checks attributes
+    # on every open.  The large entry_timeout prevents the kernel from
+    # refreshing attrs via LOOKUP before OPEN, which is necessary to
+    # expose the stale cached size bug.
+    cmdline = base_cmdline + \
+              [ pjoin(basename, 'example', 'passthrough'),
+                '-f', mnt_dir,
+                '-o', 'auto_cache,attr_timeout=9999,entry_timeout=9999,'
+                      'ac_attr_timeout=0' ]
+
+    mount_process = subprocess.Popen(cmdline, stdout=output_checker.fd,
+                                     stderr=output_checker.fd)
+    try:
+        wait_for_mount(mount_process, mnt_dir)
+        work_dir = mnt_dir + src_dir
+
+        # Create a small file in the source directory
+        src_file = pjoin(src_dir, 'testfile')
+        small_data = b'A' * 100
+        with open(src_file, 'wb') as fh:
+            fh.write(small_data)
+
+        # Read through the mount to cache the inode (including size=100).
+        # Use os.open/os.read to avoid Python buffered IO which may
+        # trigger the kernel's attr refresh safeguard.
+        mnt_file = pjoin(work_dir, 'testfile')
+        fd = os.open(mnt_file, os.O_RDONLY)
+        data = os.read(fd, len(small_data))
+        os.close(fd)
+        assert data == small_data
+
+        # Wait to ensure mtime changes and ac_attr_timeout expires
+        safe_sleep(1)
+
+        # Grow the file externally (bypassing the FUSE mount)
+        big_data = b'B' * 10000
+        with open(src_file, 'wb') as fh:
+            fh.write(big_data)
+
+        # Read through the mount again. Opening triggers open_auto_cache
+        # which detects the size change and (with the fix) invalidates
+        # the kernel inode cache via fuse_lowlevel_notify_inval_inode().
+        # Without the fix, the kernel's cached i_size is still 100
+        # and os.read() returns only 100 bytes instead of 10000.
+        fd = os.open(mnt_file, os.O_RDONLY)
+        data = os.read(fd, len(big_data))
+        os.close(fd)
+
+        assert len(data) == len(big_data), \
+            (f'Read {len(data)} bytes but expected {len(big_data)} '
+             f'(stale cached size from kernel inode?)')
+        assert data == big_data
+
+    except:
+        cleanup(mount_process, mnt_dir)
+        raise
+    else:
+        umount(mount_process, mnt_dir)
+
+
 # avoid warning about unused import
 assert test_printcap

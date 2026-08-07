@@ -3238,6 +3238,7 @@ static void open_auto_cache(struct fuse *f, fuse_ino_t ino, const char *path,
 			    struct fuse_file_info *fi)
 {
 	struct node *node;
+	int invalidate_inode = 0;
 
 	pthread_mutex_lock(&f->lock);
 	node = get_node(f, ino);
@@ -3252,9 +3253,16 @@ static void open_auto_cache(struct fuse *f, fuse_ino_t ino, const char *path,
 			pthread_mutex_unlock(&f->lock);
 			err = fuse_fs_getattr(f->fs, path, &stbuf, fi);
 			pthread_mutex_lock(&f->lock);
-			if (!err)
+			if (!err) {
+				/* If the file size changed, we need to
+				   invalidate the kernel's cached inode
+				   to purge stale page cache and prevent
+				   reads from being truncated to the old
+				   size */
+				if (stbuf.st_size != node->size)
+					invalidate_inode = 1;
 				update_stat(node, &stbuf);
-			else
+			} else
 				node->cache_valid = 0;
 		}
 	}
@@ -3263,6 +3271,9 @@ static void open_auto_cache(struct fuse *f, fuse_ino_t ino, const char *path,
 
 	node->cache_valid = 1;
 	pthread_mutex_unlock(&f->lock);
+
+	if (invalidate_inode)
+		fuse_lowlevel_notify_inval_inode(f->se, ino, 0, 0);
 }
 
 static void fuse_lib_open(fuse_req_t req, fuse_ino_t ino,
